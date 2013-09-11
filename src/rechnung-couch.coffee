@@ -13,18 +13,30 @@ uuid = -> 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace /[xy]/g, (c) ->
   v = if c is 'x' then r else r&0x3|0x8
   return v.toString 16;
 
+configuration =
+  steuer: .19
+
 class Rechnung
-  constructor: (@rechnungsnummer, @adresse, @datum, @einheiten, inklusive, @_rev) ->
-    @id              = @rechnungsnummer or uuid()
-    @inklusive       = if inklusive is undefined then true else !!inklusive
+  constructor: (@rechnungsnummer, @adresse = [], @datum, einheiten, inklusive, @_rev) ->
+    throw new Error 'rechnungsnummer required' if not @rechnungsnummer
+    @id             = @rechnungsnummer or uuid()
+    @inklusive      = if inklusive is undefined then true else !!inklusive
+    @state          = Rechnung.states.created
+    einheiten       = [] if not Array.isArray einheiten
+    @einheiten      = einheiten.map (einheit) -> Einheit.createFromCouchSync einheit
 
   add: (einheit) ->
     @einheiten.push einheit
 
   summe: ->
-    @einheiten.reduce (sum, einheit) ->
+    result = @einheiten.reduce (sum, einheit) ->
       sum + einheit.summe()
     , 0
+    result *= (1 + configuration.steuer) if not @inklusive
+    result
+
+  summeSteuern: ->
+    @summe() / (1 + configuration.steuer)
 
   equal: (rechnung, revision = true) ->
     return false if revision and @_rev isnt rechnung._rev
@@ -41,9 +53,40 @@ class Rechnung
       @datum is rechnung.datum
       @inklusive is rechnung.inklusive
 
+  save: (db, fn) ->
+    if not fn then return (fn) => @save db, fn
+    create(db) @, fn
+
+  send: (db, fn) ->
+    if not fn then return (fn) => @send db, fn
+    @state = Rechnung.states.send
+    @save db, fn
+
+  pay: (db, fn) ->
+    if not fn then return (fn) => @pay db, fn
+    @state = Rechnung.states.paid
+    @save db, fn
+
+  archive: (db, fn) ->
+    if not fn then return (fn) => @archive db, fn
+    @state = Rechnung.states.archived
+    @save db, fn
+
+Rechnung.createFromCouchSync = (body) ->
+  rechnung = new Rechnung body.rechnungsnummer, body.adresse, body.datum, body.einheiten, body.inklusive, body._rev
+  rechnung.state = body.state || rechnung.state
+  rechnung
+
 Rechnung.createFromCouch = (fn) -> (err, body) ->
   return fn err, body if err
-  fn err, new Rechnung body.rechnungsnummer, body.adresse, body.datumstr, body.einheiten, body.inklusive, body._rev
+  fn err, Rechnung.createFromCouchSync body
+
+Rechnung.states =
+  created : 'created'
+  send    : 'send'
+  paid    : 'paid'
+  archived: 'archived'
+
 
 class Einheit
   constructor: (@datum, @text, @menge, @preis) ->
@@ -62,13 +105,14 @@ class Einheit
   equal: ->
     true
 
+Einheit.createFromCouchSync = (body) -> new Einheit body.datum, body.text, body.menge, body.preis
+
 create = (db) -> (rechnung, fn) ->
   db.insert rechnung, rechnung.id, (err, body) ->
     return fn err, body if err
     rechnung._rev = body.rev
     rechnung.id = body.id
-    fn err, rechnung
-
+    Rechnung.createFromCouch(fn) err, rechnung
 
 read = (db) -> (rechnungsnummer, fn) ->
   if rechnungsnummer instanceof Rechnung
@@ -76,21 +120,37 @@ read = (db) -> (rechnungsnummer, fn) ->
 
   db.get rechnungsnummer, Rechnung.createFromCouch fn
 
+viewToRechnungen = (fn) -> (err, body) ->
+  return fn err, body if err
+  row = body.total_rows
+  results = []
+  while row--
+    results[row] = Rechnung.createFromCouchSync body.rows[row].value
+  fn null, results
 
-update = (db) -> (rechnung, fn) ->
-  (create db) rechnung, Rechnung.createFromCouch fn
+retrieveView = (db, design, view) -> (params, fn) ->
+  if(!fn)
+    fn      = params
+    params  = {}
+  db.view design, view, params, viewToRechnungen fn
+
+views =
+  list      : (db) -> retrieveView db, 'rechnungCouch', 'listAll'
+  onlyUnsend: (db) -> retrieveView db, 'rechnungCouch', 'onlyUnsend'
+  onlyUnpaid: (db) -> retrieveView db, 'rechnungCouch', 'onlyUnpaid'
+  onlyPaid  : (db) -> retrieveView db, 'rechnungCouch', 'onlyPaid'
 
 rechnungCouch =
   Rechnung    : Rechnung
   Einheit     : Einheit
   connect     : (db) ->
-    onlyUnSend  : (fn) ->
-    onlyUnpaid  : (fn) ->
-    onlyPaid    : (fn) ->
-    list        : (params, fn) ->
+    onlyUnsend  : views.onlyUnsend db
+    onlyUnpaid  : views.onlyUnpaid db
+    onlyPaid    : views.onlyPaid db
+    list        : views.list db
     create      : create db
     read        : read db
-    update      : update db
+    update      : create db # Same as create in couchDB
 
 module.exports = rechnungCouch
 
